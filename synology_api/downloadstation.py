@@ -155,6 +155,8 @@ class DownloadStation(base_api.BaseApi):
             self.download_st_version = '2'
         else:
             self.download_st_version = ''
+            self._v2_checked: bool = False
+            self._v2_available: bool = False
 
     def get_info(self) -> dict[str, object] | str:
         """
@@ -503,17 +505,47 @@ class DownloadStation(base_api.BaseApi):
 
         # V1 API (SYNO.DownloadStation.Task) uses 'uri' parameter.
         # V2 API (SYNO.DownloadStation2.Task) uses 'type=url' + 'url=[...]' parameters.
-        # TODO: investigate V2 API — tested on DSM 7.2 and returns
-        #       'Preserve for other purpose' for all parameter combinations.
-        #       May work on other DSM versions or NAS models.
+        #
+        # V2 with POST avoids HTTP 414 (URI Too Large) for long URLs
+        # like magnet links with many trackers. The V2 API is reserved by
+        # Synology and may return 'Preserve for other purpose' on some DSM
+        # versions — in that case we fall back to V1 GET.
+        # See: https://github.com/N4S4/synology-api/issues/431
         if self.download_st_version == '2':
             req_param = {'version': info['maxVersion'], 'method': 'create', 'type': 'url',
                          'create_list': 'true', 'destination': destination, 'url': f'["{url}"]'}
-        else:
-            req_param = {'version': info['maxVersion'],
-                         'method': 'create', 'uri': url}
-            if destination:
-                req_param['destination'] = destination
+            return self.request_data(api_name, api_path, req_param, method='post')
+
+        # Auto-detect V2 support (only when download_st_version is not explicitly set)
+        if not self._v2_checked:
+            self._v2_checked = True
+            try:
+                v2_api_name = 'SYNO.DownloadStation2.Task'
+                v2_info = self.download_list.get(v2_api_name)
+                if v2_info is not None:
+                    v2_req = {'version': v2_info['maxVersion'], 'method': 'create',
+                              'type': 'url', 'create_list': 'true',
+                              'destination': destination, 'url': f'["{url}"]'}
+                    result = self.request_data(v2_api_name, v2_info['path'],
+                                               v2_req, method='post')
+                    if isinstance(result, dict) and result.get('success'):
+                        self._v2_available = True
+                        return result
+            except Exception:
+                pass  # V2 blocked — fall through to V1
+
+        if self._v2_available:
+            v2_api_name = 'SYNO.DownloadStation2.Task'
+            v2_info = self.download_list[v2_api_name]
+            req_param = {'version': v2_info['maxVersion'], 'method': 'create', 'type': 'url',
+                         'create_list': 'true', 'destination': destination, 'url': f'["{url}"]'}
+            return self.request_data(v2_api_name, v2_info['path'], req_param, method='post')
+
+        # V1 fallback
+        req_param = {'version': info['maxVersion'],
+                     'method': 'create', 'uri': url}
+        if destination:
+            req_param['destination'] = destination
         return self.request_data(api_name, api_path, req_param)
 
     def delete_task(self, task_id: str, force: bool = False) -> dict[str, object] | str:
